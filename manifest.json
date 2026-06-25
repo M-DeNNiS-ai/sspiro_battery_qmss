@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+
+  <!-- Primary Meta -->
+  <title>Spiro Battery QMS</title>
+  <meta name="description" content="Spiro Uganda Battery Quality Management System" />
+  <meta name="theme-color" content="#0D1B3E" />
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="SpiroQMS" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="icon" type="image/png" href="icons/icon-192.png" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: #0D1B3E;
+      color: #1A1F36;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      overscroll-behavior: none;
+    }
+
+    #app {
+      min-height: 100vh;
+      min-height: 100dvh;
+    }
+
+    /* Prevent callout/selection on interactive elements */
+    button, label, select { -webkit-user-select: none; user-select: none; }
+
+    /* Hide scrollbars */
+    ::-webkit-scrollbar { display: none; }
+
+    /* Offline banner */
+    #offline-bar {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      background: #E65100;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      text-align: center;
+      padding: 5px 12px;
+      z-index: 9999;
+    }
+    #offline-bar.visible { display: block; }
+
+    /* Splash screen */
+    #splash {
+      position: fixed;
+      inset: 0;
+      background: #0D1B3E;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 9998;
+      transition: opacity 0.35s ease;
+    }
+    #splash.fade { opacity: 0; pointer-events: none; }
+    #splash-icon { font-size: 52px; margin-bottom: 12px; }
+    #splash h1 { color: #fff; font-size: 22px; font-weight: 800; }
+    #splash p  { color: rgba(255,255,255,0.5); font-size: 13px; margin-top: 6px; }
+    #splash-bar {
+      width: 120px; height: 3px;
+      background: rgba(255,255,255,0.15);
+      border-radius: 2px;
+      margin-top: 28px;
+      overflow: hidden;
+    }
+    #splash-fill {
+      height: 100%;
+      background: #42A5F5;
+      border-radius: 2px;
+      animation: splash-load 1.4s ease forwards;
+    }
+    @keyframes splash-load { from { width: 0; } to { width: 100%; } }
+
+    /* iOS install hint */
+    #ios-hint {
+      display: none;
+      position: fixed;
+      bottom: 76px; left: 12px; right: 12px;
+      background: #0D1B3E;
+      color: #fff;
+      border-radius: 12px;
+      padding: 14px 14px 14px 16px;
+      font-size: 13px;
+      line-height: 1.5;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+      z-index: 9997;
+    }
+    #ios-hint.visible { display: flex; align-items: center; gap: 10px; }
+    #ios-hint .msg { flex: 1; }
+    #ios-hint button {
+      background: rgba(255,255,255,0.18);
+      border: none;
+      color: #fff;
+      padding: 5px 10px;
+      border-radius: 7px;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    /* Android install banner */
+    #android-banner {
+      display: none;
+      position: fixed;
+      bottom: 76px; left: 12px; right: 12px;
+      background: #1565C0;
+      color: #fff;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 13px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+      z-index: 9997;
+      align-items: center;
+      gap: 10px;
+    }
+    #android-banner.visible { display: flex; }
+    #android-banner .msg { flex: 1; line-height: 1.4; }
+    #android-banner .msg strong { display: block; font-size: 14px; }
+    #android-banner #install-btn { background: #fff; color: #1565C0; border: none; padding: 7px 14px; border-radius: 7px; font-weight: 700; font-size: 13px; cursor: pointer; white-space: nowrap; }
+    #android-banner #dismiss-btn { background: rgba(255,255,255,0.2); border: none; color: #fff; padding: 7px 10px; border-radius: 7px; font-size: 13px; cursor: pointer; }
+  </style>
+</head>
+<body>
+
+  <!-- Offline indicator -->
+  <div id="offline-bar">⚠️ No internet — data saves locally and syncs when reconnected</div>
+
+  <!-- Splash screen -->
+  <div id="splash">
+    <div id="splash-icon">⚡</div>
+    <h1>Spiro Battery QMS</h1>
+    <p>Battery Quality Management System</p>
+    <div id="splash-bar"><div id="splash-fill"></div></div>
+  </div>
+
+  <!-- iOS install hint -->
+  <div id="ios-hint">
+    <div class="msg">
+      <strong>📱 Install on iPhone</strong>
+      Tap <strong>Share ↑</strong> then <strong>"Add to Home Screen"</strong>
+    </div>
+    <button onclick="document.getElementById('ios-hint').classList.remove('visible'); localStorage.setItem('spiro_ios_dismissed','1')">Got it</button>
+  </div>
+
+  <!-- Android install banner -->
+  <div id="android-banner">
+    <div class="msg">
+      <strong>Install Spiro QMS</strong>
+      Add to home screen for offline access
+    </div>
+    <button id="install-btn">Install</button>
+    <button id="dismiss-btn">✕</button>
+  </div>
+
+  <!-- React app mount point -->
+  <div id="app"></div>
+
+  <!-- Dependencies (loaded before app.js) -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" crossorigin></script>
+
+  <!-- Main application -->
+  <script src="app.js"></script>
+
+  <!-- PWA bootstrap (runs after app.js) -->
+  <script src="pwa.js"></script>
+
+</body>
+</html>

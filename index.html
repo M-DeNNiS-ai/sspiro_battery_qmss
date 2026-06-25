@@ -1,0 +1,1432 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPIRO BATTERY QMS — app.js
+// Full application: no JSX, no build step, runs directly in browser
+// Dependencies loaded via CDN in index.html: React 18, ReactDOM 18, SheetJS
+// ═══════════════════════════════════════════════════════════════════════════════
+(function () {
+  'use strict';
+
+  // Guard: wait for React if CDN is slow
+  if (typeof React === 'undefined' || typeof ReactDOM === 'undefined') {
+    document.addEventListener('DOMContentLoaded', function () { initApp(); });
+    return;
+  }
+  initApp();
+
+  function initApp() {
+
+    var useState    = React.useState;
+    var useRef      = React.useRef;
+    var useEffect   = React.useEffect;
+    var useCallback = React.useCallback;
+    var useMemo     = React.useMemo;
+    var h           = React.createElement;
+    var Fragment    = React.Fragment;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MICROSOFT GRAPH CONFIG
+    // Fill in clientId and tenantId after Azure app registration
+    // See SETUP_GUIDE.md for full instructions
+    // ═══════════════════════════════════════════════════════════════════════════
+    var GC = {
+      clientId:  'YOUR_CLIENT_ID_HERE',
+      tenantId:  'YOUR_TENANT_ID_HERE',
+      files: {
+        OK:       'Spiro_OK_Charging.xlsx',
+        REPAIR:   'Spiro_Incoming_Repair.xlsx',
+        WARRANTY: 'Spiro_Warranty_Parts.xlsx',
+      },
+      tableName: 'BatteryLog',
+    };
+
+    function isConfigured() {
+      return GC.clientId !== 'YOUR_CLIENT_ID_HERE' && GC.tenantId !== 'YOUR_TENANT_ID_HERE';
+    }
+
+    // ── Microsoft Graph token ────────────────────────────────────────────────
+    var _msalToken = null;
+    var _msalExpiry = 0;
+
+    function loadMSAL() {
+      return new Promise(function (resolve, reject) {
+        if (window.msal) { resolve(); return; }
+        var s = document.createElement('script');
+        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/microsoft-authentication-library/2.38.0/msal-browser.min.js';
+        s.onload = resolve;
+        s.onerror = function () { reject(new Error('Failed to load MSAL library. Check internet connection.')); };
+        document.head.appendChild(s);
+      });
+    }
+
+    async function getToken() {
+      if (_msalToken && Date.now() < _msalExpiry - 60000) return _msalToken;
+      await loadMSAL();
+      var config = {
+        auth: {
+          clientId:    GC.clientId,
+          authority:   'https://login.microsoftonline.com/' + GC.tenantId,
+          redirectUri: window.location.origin,
+        },
+        cache: { cacheLocation: 'sessionStorage' },
+      };
+      var msalInstance = new window.msal.PublicClientApplication(config);
+      await msalInstance.initialize();
+      var scopes = ['https://graph.microsoft.com/Files.ReadWrite.All'];
+      try {
+        var accounts = msalInstance.getAllAccounts();
+        if (accounts.length > 0) {
+          var silent = await msalInstance.acquireTokenSilent({ scopes: scopes, account: accounts[0] });
+          _msalToken  = silent.accessToken;
+          _msalExpiry = silent.expiresOn.getTime();
+          return _msalToken;
+        }
+      } catch (e) { /* silent failed — fall through to popup */ }
+      var result = await msalInstance.loginPopup({ scopes: scopes });
+      _msalToken  = result.accessToken;
+      _msalExpiry = result.expiresOn ? result.expiresOn.getTime() : Date.now() + 3600000;
+      return _msalToken;
+    }
+
+    async function syncEntryToOneDrive(entry) {
+      var token    = await getToken();
+      var cat      = (entry.route && entry.route.cat) ? entry.route.cat : 'REPAIR';
+      var filename = GC.files[cat];
+      if (!filename) throw new Error('No Excel file configured for category: ' + cat);
+
+      // Find file on OneDrive
+      var searchUrl = "https://graph.microsoft.com/v1.0/me/drive/root/children"
+        + "?$filter=name eq '" + encodeURIComponent(filename) + "'&$select=id,name";
+      var searchRes = await fetch(searchUrl, { headers: { Authorization: 'Bearer ' + token } });
+      if (!searchRes.ok) throw new Error('Cannot reach OneDrive. Check internet and permissions.');
+      var searchData = await searchRes.json();
+      if (!searchData.value || searchData.value.length === 0) {
+        throw new Error('File "' + filename + '" not found on OneDrive root. Upload the Excel templates first.');
+      }
+      var fileId = searchData.value[0].id;
+
+      // Build row
+      var f = entry.form || {};
+      var delta = '';
+      if (f.cellVoltageMin && f.cellVoltageMax) {
+        delta = ((parseFloat(f.cellVoltageMax) - parseFloat(f.cellVoltageMin)) * 1000).toFixed(0);
+      }
+      var row = [
+        entry.timestamp || '',
+        entry.serial    || '',
+        entry.batteryType || '',
+        entry.technician  || '',
+        f.cellVoltageMin  || '',
+        f.cellVoltageMax  || '',
+        delta,
+        f.packVoltage  || '',
+        f.t1 || '', f.t2 || '', f.t3 || '', f.t4 || '',
+        f.mosfetStatus || '',
+        f.afeAlarm     ? f.afeAlarm.replace(/_/g, ' ')   : '',
+        f.canCharge    || '',
+        f.canDischarge || '',
+        f.ledPattern   ? f.ledPattern.replace(/_/g, ' ') : '',
+        (f.missingParts  || []).join('; '),
+        (f.physicalDamage || []).join('; '),
+        f.missingBoltCount  || '',
+        f.missingCellCount  || '',
+        (entry.route && entry.route.issues ? entry.route.issues : []).join('; '),
+        f.observations || '',
+        cat,
+      ];
+
+      // Append row to Excel table
+      var writeUrl = 'https://graph.microsoft.com/v1.0/me/drive/items/'
+        + fileId + '/workbook/tables/' + GC.tableName + '/rows/add';
+      var writeRes = await fetch(writeUrl, {
+        method:  'POST',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ values: [row] }),
+      });
+      if (!writeRes.ok) {
+        var errData = await writeRes.json().catch(function () { return {}; });
+        throw new Error(
+          (errData.error && errData.error.message)
+            ? errData.error.message
+            : 'Excel write failed (HTTP ' + writeRes.status + '). Check table name "' + GC.tableName + '".'
+        );
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS — BATTERY TYPES
+    // ═══════════════════════════════════════════════════════════════════════════
+    var BT = {
+      C: { name: 'CBAK',     prefix: 'C7245AC2AA', len: 18, color: '#1565C0', light: '#E3F2FD' },
+      U: { name: 'Unique',   prefix: 'U7245AU1G1',  len: 18, color: '#2E7D32', light: '#E8F5E9' },
+      A: { name: 'Ampace',   prefix: 'A7246AX1A1',  len: 18, color: '#E65100', light: '#FFF3E0' },
+      D: { name: 'Greenway', prefix: 'D72451LWK',   len: 18, color: '#6A1B9A', light: '#F3E5F5' },
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS — LED PATTERNS (per battery type)
+    // ═══════════════════════════════════════════════════════════════════════════
+    var LED = {
+      C: [
+        { v: '1_led',        l: '1 LED – Low SOC (<25%)' },
+        { v: '2_leds',       l: '2 LEDs – SOC 25–50%' },
+        { v: '3_leds',       l: '3 LEDs – SOC 50–75%' },
+        { v: '4_leds',       l: '4 LEDs – Full / Normal ✓' },
+        { v: 'blink_fault',  l: 'Blinking – Fault / Error' },
+        { v: 'no_display',   l: 'No Display' },
+      ],
+      U: [
+        { v: '1_led',        l: '1 LED – Low SOC' },
+        { v: '2_leds',       l: '2 LEDs – SOC 25–50%' },
+        { v: '3_leds',       l: '3 LEDs – SOC 50–75%' },
+        { v: '4_leds',       l: '4 LEDs – Full / Normal ✓' },
+        { v: '1_mid_red',    l: '1 Middle LED Blinking Red – BMS Fault' },
+        { v: '3_mid_red',    l: '3 Middle LEDs Blinking Red – Cell Fault' },
+        { v: '5_all_red',    l: '5 All LEDs Blinking Red – Critical Fault' },
+        { v: 'no_display',   l: 'No Display' },
+      ],
+      A: [
+        { v: '1_led',        l: '1 LED – Low SOC' },
+        { v: '2_leds',       l: '2 LEDs – SOC 25–50%' },
+        { v: '3_leds',       l: '3 LEDs – SOC 50–75%' },
+        { v: '4_leds',       l: '4 LEDs – SOC 75–100%' },
+        { v: '5_leds',       l: '5 LEDs – Full ✓' },
+        { v: '2_extreme',    l: '2 Extreme LEDs Blinking – Comm Fault' },
+        { v: '5_blink',      l: '5 LEDs Blinking – Critical Fault' },
+        { v: '1_no_chg',     l: '1 LED Not Charging – CHG MOSFET Fault' },
+        { v: 'no_display',   l: 'No Display' },
+      ],
+      D: [
+        { v: '1_led',        l: '1 LED – Low SOC' },
+        { v: '2_leds',       l: '2 LEDs – SOC 25–50%' },
+        { v: '3_leds',       l: '3 LEDs – SOC 50–75%' },
+        { v: '4_leds',       l: '4 LEDs – Full / Normal ✓' },
+        { v: 'blink_fault',  l: 'Blinking – Fault' },
+        { v: 'no_display',   l: 'No Display' },
+      ],
+    };
+
+    var LED_FAULT_VALUES = [
+      'blink_fault', '1_mid_red', '3_mid_red', '5_all_red',
+      '2_extreme', '5_blink', '1_no_chg', 'no_display',
+    ];
+    function isLedFault(v) { return LED_FAULT_VALUES.indexOf(v) !== -1; }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS — AFE ALARMS
+    // ═══════════════════════════════════════════════════════════════════════════
+    var AFE = [
+      { v: 'none',      l: 'None – No alarm' },
+      { v: 'cell_ov',   l: 'Cell Overvoltage – All LEDs on, charging stops' },
+      { v: 'cell_uv',   l: 'Cell Undervoltage – 1 LED blinking, discharge cut-off' },
+      { v: 'pack_ov',   l: 'Pack Overvoltage – BMS shuts CHG MOSFET' },
+      { v: 'pack_uv',   l: 'Pack Undervoltage – BMS shuts DSG MOSFET' },
+      { v: 'ot_chg',    l: 'Overtemp (Charging) – Charging halted, LED blinks' },
+      { v: 'ot_dsg',    l: 'Overtemp (Discharging) – DSG cut, thermal alarm' },
+      { v: 'sc',        l: 'Short Circuit – Immediate DSG MOSFET trip' },
+      { v: 'oc_chg',    l: 'Overcurrent (Charging) – CHG MOSFET trips' },
+      { v: 'oc_dsg',    l: 'Overcurrent (Discharging) – DSG MOSFET trips' },
+      { v: 'afe_comm',  l: 'AFE Comm Fault – BMS unresponsive, no LED' },
+      { v: 'bal_fault', l: 'Cell Balancing Fault – Delta V >500mV persists' },
+    ];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS — MISSING PARTS & PHYSICAL DAMAGE
+    // ═══════════════════════════════════════════════════════════════════════════
+    var MISSING = [
+      { v: 'handles',          l: 'Handle(s)' },
+      { v: 'front_cover',      l: 'Front Cover' },
+      { v: 'back_cover',       l: 'Back Cover' },
+      { v: 'charging_port',    l: 'Charging Port' },
+      { v: 'discharging_port', l: 'Discharging Port' },
+      { v: 'bms_board',        l: 'BMS Board' },
+      { v: 'wire_harness',     l: 'Wire Harness' },
+      { v: 'cells',            l: 'Cells (stolen/missing)' },
+      { v: 'iot_device',       l: 'IoT Device' },
+      { v: 'epoxy_board',      l: 'Epoxy Board(s)' },
+      { v: 'bolts',            l: 'Bolts' },
+      { v: 'ntc_cable',        l: 'NTC Cable' },
+      { v: 'bms_cover',        l: 'BMS Cover' },
+      { v: 'connectors',       l: 'Connectors' },
+    ];
+
+    var DAMAGE = [
+      { v: 'handle_broken',    l: 'Handle – Broken' },
+      { v: 'handle_bent',      l: 'Handle – Bent (1 or 2)' },
+      { v: 'fc_broken',        l: 'Front Cover – Broken' },
+      { v: 'fc_bent',          l: 'Front Cover – Bent' },
+      { v: 'fc_holes',         l: 'Front Cover – Has Holes' },
+      { v: 'fc_destroyed',     l: 'Front Cover – Destroyed' },
+      { v: 'bc_broken',        l: 'Back Cover – Broken' },
+      { v: 'bc_bent',          l: 'Back Cover – Bent' },
+      { v: 'bc_holes',         l: 'Back Cover – Has Holes' },
+      { v: 'bc_destroyed',     l: 'Back Cover – Destroyed' },
+      { v: 'chg_port_dmg',     l: 'Charging Port – Damaged' },
+      { v: 'dsg_port_dmg',     l: 'Discharging Port – Damaged' },
+      { v: 'burn',             l: 'Burn Marks' },
+      { v: 'swell',            l: 'Case Swelling' },
+      { v: 'water',            l: 'Water / Moisture Damage' },
+    ];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS — TECHNICIANS
+    // ═══════════════════════════════════════════════════════════════════════════
+    var TECHS = [
+      { id: 't1', name: 'Dennis Mugambwa',  role: 'Battery Quality Engineer', pin: '1234' },
+      { id: 't2', name: 'Technician Alpha', role: 'CBAK Rework Tech',         pin: '2222' },
+      { id: 't3', name: 'Technician Beta',  role: 'PDI Inspector',            pin: '3333' },
+    ];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS — REPAIR STATUSES
+    // ═══════════════════════════════════════════════════════════════════════════
+    var STATUSES = [
+      'Pending Repair', 'In Repair', 'Post-Repair Check',
+      'Online Test', 'Offline – Failed', 'Ready for Dispatch', 'Dispatched',
+    ];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SOP TROUBLESHOOTING DATABASE
+    // ═══════════════════════════════════════════════════════════════════════════
+    var SOP = {
+      cell_uv: {
+        title: 'Cell Undervoltage (<2.6V)',
+        cause: 'One or more cells discharged below 2.6V. Causes: deep discharge in the field, prolonged storage without charge, BMS DSG MOSFET not cutting off in time, or aged cells with reduced capacity.',
+        steps: [
+          'PPE first: wear insulated gloves and safety glasses before opening battery.',
+          'Measure each cell group voltage using the BMS balance connector with a multimeter. Record all readings. Identify which groups are below 2.6V.',
+          'Connect laptop via UART cable. Read BMS cell voltages and check for UV protection flags. If BMS is unresponsive, suspect AFE comm fault as a secondary issue.',
+          'If lowest cell group ≥ 2.0V: attempt slow recovery charge using bench power supply in CC mode. Set current to 0.05C, voltage limit 3.0V per cell group. Run for 30–60 minutes.',
+          'If lowest cell group < 2.0V: cell is deeply discharged. Do NOT charge. Mark as WARRANTY — cell group replacement required. Disconnect all cell groups and store safely.',
+          'After recovery charge, if all cells reach ≥ 3.0V: run full charge cycle on charger. Monitor balance delta throughout. If delta stays < 200mV at full charge, battery is acceptable.',
+          'If delta exceeds 500mV at full charge even after balancing: the recovered cell has high internal resistance. Escalate to cell replacement.',
+          'Document all voltage readings before and after recovery in the repair record.',
+        ],
+        route: 'REPAIR — possible WARRANTY if cell group <2.0V',
+        warning: 'NEVER fast-charge a deeply discharged LiFePO4 cell. Fast charging a cell below 2.5V causes irreversible lithium plating, internal short risk, and potential thermal runaway.',
+      },
+      cell_ov: {
+        title: 'Cell / Pack Overvoltage (>3.65V cell / >54.6V pack)',
+        cause: 'BMS CHG MOSFET failed to cut off charging at the upper voltage limit. Causes: MOSFET failure, charger overvoltage output, BMS firmware protection bug, or damaged BMS protection circuit.',
+        steps: [
+          'Immediately disconnect battery from charger. Do not leave unattended.',
+          'Measure pack voltage at discharge terminals with multimeter. If >55V, isolate the battery in a fireproof container or metal cabinet away from other batteries.',
+          'Connect UART. Read individual cell group voltages. Identify which cells are over 3.65V. Record values.',
+          'Measure charger output voltage separately (no battery connected). Should be ≤54.6V. If charger reads >55V, the charger is faulty — remove from service immediately.',
+          'If charger is within spec: BMS overvoltage protection has failed. Check MOSFET driver circuit on BMS board for visible damage.',
+          'Allow battery to self-discharge to below 3.5V/cell through a controlled resistive load before any further repair work.',
+          'Replace BMS board. After replacement, verify CHG cutoff by charging and monitoring with UART — cell voltage must not exceed 3.65V before BMS cuts charging.',
+        ],
+        route: 'REPAIR – BMS board replacement likely',
+        warning: 'An overvoltage battery is at elevated risk of thermal runaway. Keep away from flammable materials. Do not leave it in an enclosed space. Monitor temperature every 15 minutes until voltage normalises.',
+      },
+      mosfet_chg: {
+        title: 'CHG MOSFET Fault (Cannot Charge)',
+        cause: 'The charging MOSFET is open-circuit and cannot conduct. The battery cannot receive charge. Causes: overcurrent during a charging event, overvoltage damage, manufacturing defect, or physical damage to the BMS board.',
+        steps: [
+          'Connect charger. Measure voltage at the charging port with multimeter. If charger voltage is present at the port but battery SOC is not rising after 10 minutes, CHG MOSFET is confirmed open.',
+          'Connect UART. Read BMS protection flags. Look for CHG_OC (charge overcurrent) or CHG_OV (charge overvoltage) flags. These indicate what triggered the MOSFET lockout.',
+          'Attempt BMS protection reset via UART command (refer to BMS UART command set for the specific battery type). After reset, reconnect charger and retest.',
+          'Visually inspect BMS board under bright light. Look for burn marks, cracked solder joints, or component damage in the MOSFET area (Q1/Q2 typically on CBAK boards).',
+          'If reset does not restore charging: BMS board replacement required. Before removal, note the current firmware version (read via UART). Replacement BMS must match or be upgraded to a higher firmware version.',
+          'After BMS replacement: verify charge current flows. Connect charger and use clamp meter on charge cable. Should read positive current (typically 4–8A for 48V charger) within 30 seconds.',
+          'Run a full charge cycle to 100% SOC and confirm BMS cuts off correctly at upper voltage limit.',
+        ],
+        route: 'REPAIR – BMS board replacement',
+        warning: 'Always disconnect the IoT device before removing the BMS board. Never short the BMS CHG/DSG terminals directly. Anti-static precautions required when handling replacement BMS.',
+      },
+      mosfet_dsg: {
+        title: 'DSG MOSFET Fault (Cannot Discharge)',
+        cause: 'The discharge MOSFET is open-circuit. Battery shows SOC on LED but cannot power the motorcycle. Causes: overcurrent from field load, short circuit event, MOSFET aging, or BMS lockout after a protection event.',
+        steps: [
+          'Confirm: battery LED shows charge level but motorcycle does not power on. Measure voltage at the discharge port with multimeter — if less than 5V despite pack voltage being normal, DSG MOSFET is open.',
+          'Inspect discharge connector and wire harness for signs of a short circuit event: melted insulation, burn marks, or charring.',
+          'Connect UART. Read DSG_OC (discharge overcurrent) and SC (short circuit) protection flags in BMS registers.',
+          'If short circuit flag (SC) is set: the protection latched after a short. To clear, briefly connect a known resistive load (e.g. 48V lamp or resistor) to the discharge port — this resets the SC latch on most BMS types. Retest discharge.',
+          'If SC flag clears and discharge resumes: inspect the motorcycle wiring for the short circuit before returning battery. The fault is in the vehicle, not the battery.',
+          'If MOSFET remains open after flag clear: MOSFET has been physically damaged. BMS board replacement required.',
+          'Before reinstalling, inspect wire harness for any damaged insulation. Repair with fiberglass tape as per rework SOP before returning to service.',
+        ],
+        route: 'REPAIR – BMS replacement or wire harness repair',
+        warning: 'If burn marks are present from a short circuit event, inspect all cell interconnects and nickel strip welds before recharging. A welded short on the cell level is a fire hazard.',
+      },
+      high_temp: {
+        title: 'High Temperature (>45°C on any sensor)',
+        cause: 'Battery operating above safe threshold. Causes: charging or discharging in direct sunlight, blocked ventilation around pack, overcharge, internal cell fault, ambient temperature in storage, or loose/misplaced NTC sensor giving false high reading.',
+        steps: [
+          'Immediately remove battery from charger or motorcycle.',
+          'Move to a cool shaded area with natural airflow. Do NOT place in an enclosed metal cabinet while hot.',
+          'Allow to cool naturally for 30 minutes minimum. Do not direct a fan at the battery — rapid uneven cooling can cause thermal stress on cell connections.',
+          'After cooling, re-read all 4 temperature sensors via UART. If all 4 T readings are within 5°C of each other and close to ambient, cause was likely external (ambient/sunlight). Battery may be OK.',
+          'If one sensor reads significantly higher than the others (>10°C difference): suspect internal cell fault or NTC cable misplacement. Check NTC cable routing — per CBAK SOP, NTC cables must be secured with fiberglass tape and not pinched under cell holders.',
+          'If high temperature occurred during charging: check charger output — a faulty charger delivering above-rated current causes pack heating. Measure charger current with clamp meter.',
+          'If battery repeatedly runs hot during normal field use: read cell internal resistance via UART if supported by BMS firmware. IR values >80mΩ per cell indicate significant degradation.',
+          'Document the thermal event with all 4 temperature sensor readings in the repair record.',
+        ],
+        route: 'REPAIR if recurring or sensor fault confirmed — may be OK if ambient-caused',
+        warning: 'LiFePO4 cells begin entering thermal runaway at approximately 60°C for damaged cells. Never charge a battery above 45°C. If the casing is hot to the touch (cannot hold hand on it), treat as a thermal event and follow fire SOP.',
+      },
+      no_display: {
+        title: 'No LED Display',
+        cause: 'LED indicator board not receiving power, or BMS has fully shut down. Causes: deeply discharged cells (BMS lockout), IoT device overcurrent, LED board connector failure, BMS power rail fault, or blown fuse on BMS power input.',
+        steps: [
+          'Measure pack voltage at the discharge terminals with multimeter. If pack voltage < 36V, battery is deeply discharged — follow Cell Undervoltage SOP.',
+          'If pack voltage is ≥ 40V but no LEDs: BMS is receiving power but LED board is not. Press the LED indicator button firmly. If LEDs briefly flash and go off, the board is receiving signal intermittently — reseat the LED board connector.',
+          'Disconnect IoT device. Press LED button again. If LEDs now illuminate normally, the IoT device was drawing excessive current and triggering a BMS shutdown protection. The IoT device requires replacement.',
+          'Connect UART. If BMS responds, read all protection flags — identify which protection triggered the display shutdown.',
+          'If UART responds with no protection flags but LED board still does not illuminate: measure the 5V BMS power rail output with multimeter at the LED board connector pin. If 5V is absent, BMS power output circuit has failed.',
+          'If 5V is present at connector but LED board does not illuminate: LED board itself is faulty — replace LED board.',
+          'If UART is also unresponsive and pack voltage >40V: BMS microcontroller has failed or reset loop is occurring. Replace BMS board.',
+        ],
+        route: 'REPAIR — cause-dependent',
+        warning: 'Do not apply external voltage directly to the LED board connector to test it. Always trace the fault from the BMS output. Incorrect voltage can destroy the LED driver IC.',
+      },
+      stolen_cells: {
+        title: 'Stolen / Missing Cells (Vandalism)',
+        cause: 'Cells have been physically removed from the battery pack in the field. This is a vandalism/security event and a warranty claim. An incomplete cell pack creates dangerous voltage imbalances and must not be energised.',
+        steps: [
+          'Do NOT attempt to power on, charge, or connect to UART with cells missing. An incomplete series pack creates dangerous floating voltages.',
+          'Photograph the battery interior immediately showing empty cell slots. This is required for the warranty claim and incident report.',
+          'Count and record exactly how many cells are missing and from which positions in the cell stack.',
+          'Carefully inspect remaining cells for physical damage caused during the removal (bent tabs, punctured cell walls, torn nickel strip).',
+          'If any remaining cells show physical damage: disconnect those cell groups from the BMS balance connector before further handling.',
+          'Measure and record the voltage of each remaining cell group. Any cell group that has been isolated from the series circuit may have self-discharged unevenly.',
+          'Disconnect BMS from all cell groups. Store battery lying flat in a secure location. Do not stack other batteries on top.',
+          'File a security incident report: document battery serial number, GPS location last recorded by IoT device, date discovered, and condition found.',
+          'Log as WARRANTY. Replacement cells must be from the same batch as existing cells and within 2% capacity match. A full pack rebuild with re-welding of nickel strips is required.',
+        ],
+        route: 'WARRANTY – full cell replacement and pack rebuild required',
+        warning: 'A pack with missing cells is structurally and electrically unsafe. Never attempt a partial charge to "test" the remaining cells while the pack is incomplete. Risk of short circuit and fire.',
+      },
+      afe_comm: {
+        title: 'AFE Communication Fault',
+        cause: 'The BMS microcontroller cannot communicate with the AFE (Analog Front End) chip responsible for measuring cell voltages and temperatures. Causes: cracked PCB trace, solder joint failure on the AFE IC, electrostatic discharge damage, or moisture-induced corrosion on the BMS board.',
+        steps: [
+          'Connect UART. If BMS MCU responds but reports AFE communication errors, the MCU is alive but the AFE data bus is broken. If UART is also unresponsive, the MCU itself may have failed.',
+          'Remove BMS board. Inspect visually under bright light or magnification for cracked solder joints, especially around the largest multi-pin IC (the AFE chip).',
+          'Check for moisture or corrosion: look for white or green deposits on PCB traces near the AFE. Clean with isopropyl alcohol (IPA ≥99%) using a soft brush. Allow to dry completely — minimum 30 minutes at room temperature.',
+          'Attempt BMS reset: disconnect cell groups from balance connector one at a time (start from cell 14 working down to cell 1). Wait 30 seconds, then reconnect from cell 1 upward. Retest UART comms.',
+          'If AFE comms fault persists after cleaning and reset: the AFE IC or its SPI/I2C bus trace is damaged. BMS board replacement required.',
+          'When replacing CBAK BMS: check current firmware version via UART before removal. Replacement BMS should be upgraded to B2.7 if lower. Use the UART HEX unlock sequence to enable firmware flash mode before flashing.',
+          'After replacement, verify UART reads all 14 cell group voltages correctly before reassembly.',
+        ],
+        route: 'REPAIR – BMS board replacement',
+        warning: 'Static discharge can instantly re-damage a replacement AFE chip. Always use an anti-static wrist strap when handling any BMS board. Ground yourself on the battery casing metal frame before touching the PCB.',
+      },
+      balancing: {
+        title: 'Cell Balancing Fault (Delta >500mV)',
+        cause: 'Cell group voltages have diverged beyond the 500mV acceptable limit. Causes: one or more cell groups with elevated internal resistance due to aging, BMS passive balancing circuit failure, mixed-batch cells with different capacity, or a cell group that experienced a partial short circuit.',
+        steps: [
+          'Charge battery fully to 100% SOC on the standard charger. At full charge, the BMS should have been actively balancing. Allow extra time on charger (2–4 hours after reaching full charge indicator).',
+          'Connect UART. Read all 14 cell group voltages at full charge. At 100% SOC the spread should be ≤ 50mV. Record all readings.',
+          'Identify the outlier cell group(s). A cell that reads significantly higher than others at full charge has lower capacity — it reached its upper voltage limit sooner because it holds less charge.',
+          'If delta has reduced to <200mV after 4 hours of balancing on charger: the BMS balancing is working. Battery is acceptable for return to service but flag for monitoring.',
+          'If one cell group consistently stays >200mV above all others and does not balance down: that cell group is degraded. Test its internal resistance — if IR >80mΩ, cell replacement is required.',
+          'To test the BMS balancing circuit: during the charging/balancing phase, measure voltage across each balancing resistor on the BMS board. You should see a small voltage drop (typically 10–100mV) across resistors for cells being balanced. If no voltage is present on any resistor, the balancing FETs have failed — BMS replacement required.',
+          'Document all 14 cell voltage readings at full charge in the repair record before and after balancing.',
+        ],
+        route: 'REPAIR – extended balancing session or cell group replacement',
+        warning: 'A battery with >500mV cell delta must never be dispatched to the field. The low-capacity cell will reach undervoltage cutoff long before the other cells are depleted, causing premature BMS shutdown and potentially deep-discharging the weak cell on every cycle, accelerating its degradation.',
+      },
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SOP ISSUE → GUIDE MAPPING
+    // ═══════════════════════════════════════════════════════════════════════════
+    var SOP_MAP = {
+      cell_uv:      ['2.6v', 'undervoltage', '<42v', 'cell min'],
+      cell_ov:      ['overvoltage', '>54.6v', 'cell ov', 'pack ov'],
+      mosfet_chg:   ['chg side', 'cannot charge', 'chg mosfet'],
+      mosfet_dsg:   ['dsg side', 'cannot discharge', 'dsg mosfet'],
+      high_temp:    ['45°c', '> 45', 'temperature', 't1 =', 't2 =', 't3 =', 't4 ='],
+      no_display:   ['no display', 'no led'],
+      stolen_cells: ['stolen', 'missing cells'],
+      afe_comm:     ['afe comm', 'afe:'],
+      balancing:    ['delta', '500mv', 'balancing fault'],
+    };
+
+    function getRelevantSOPs(issues) {
+      if (!issues || issues.length === 0) return [];
+      var issuesLower = issues.map(function (i) { return i.toLowerCase(); });
+      return Object.keys(SOP_MAP).filter(function (key) {
+        var keywords = SOP_MAP[key];
+        return issuesLower.some(function (iss) {
+          return keywords.some(function (kw) { return iss.indexOf(kw) !== -1; });
+        });
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LOCAL DATABASE (localStorage)
+    // ═══════════════════════════════════════════════════════════════════════════
+    var DB_KEY = 'spiro_qms_v6';
+
+    function loadDB() {
+      try {
+        var raw = localStorage.getItem(DB_KEY);
+        var parsed = raw ? JSON.parse(raw) : null;
+        return parsed && parsed.batteries ? parsed : { batteries: [], repairs: [] };
+      } catch (e) {
+        return { batteries: [], repairs: [] };
+      }
+    }
+
+    function saveDB(db) {
+      try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) {}
+    }
+
+    var _db = loadDB();
+
+    var ldb = {
+      allBatteries:  function () { return (_db.batteries || []).slice(); },
+      allRepairs:    function () { return (_db.repairs   || []).slice(); },
+      insertBattery: function (entry) {
+        _db.batteries = [entry].concat((_db.batteries || []).filter(function (b) { return b.serial !== entry.serial; }));
+        saveDB(_db);
+      },
+      addRepair: function (repair) {
+        _db.repairs = (_db.repairs || []).concat([repair]);
+        saveDB(_db);
+      },
+      updateRepair: function (id, updates) {
+        _db.repairs = (_db.repairs || []).map(function (r) {
+          return r.id === id ? Object.assign({}, r, updates) : r;
+        });
+        saveDB(_db);
+      },
+      clear: function () {
+        _db = { batteries: [], repairs: [] };
+        saveDB(_db);
+      },
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SOP ROUTING LOGIC
+    // ═══════════════════════════════════════════════════════════════════════════
+    function routeBattery(form) {
+      var issues  = [];
+      var warrant = [];
+
+      // Cell voltages
+      var minV = parseFloat(form.cellVoltageMin);
+      var maxV = parseFloat(form.cellVoltageMax);
+      if (!isNaN(minV) && minV < 2.6) {
+        issues.push('Cell min ' + minV + 'V < 2.6V threshold');
+      }
+      if (!isNaN(minV) && !isNaN(maxV)) {
+        var delta = (maxV - minV) * 1000;
+        if (delta > 500) issues.push('Cell delta ' + delta.toFixed(0) + 'mV > 500mV limit');
+      }
+
+      // Pack voltage
+      var packV = parseFloat(form.packVoltage);
+      if (!isNaN(packV) && packV < 42)   issues.push('Pack undervoltage ' + packV + 'V <42V');
+      if (!isNaN(packV) && packV > 54.6) issues.push('Pack overvoltage '  + packV + 'V >54.6V');
+
+      // Temperatures
+      ['t1','t2','t3','t4'].forEach(function (t, i) {
+        var v = parseFloat(form[t]);
+        if (!isNaN(v) && v > 45) issues.push('T' + (i+1) + ' = ' + v + '°C > 45°C');
+      });
+
+      // MOSFET
+      if (form.mosfetStatus && form.mosfetStatus !== 'OK') {
+        issues.push('MOSFET: ' + form.mosfetStatus);
+      }
+
+      // Charge / discharge
+      if (form.canCharge    === 'No') issues.push('Cannot charge');
+      if (form.canDischarge === 'No') issues.push('Cannot discharge');
+
+      // LED
+      if (form.ledPattern && isLedFault(form.ledPattern)) {
+        issues.push('LED: ' + form.ledPattern.replace(/_/g, ' '));
+      }
+
+      // AFE alarm
+      if (form.afeAlarm && form.afeAlarm !== 'none') {
+        issues.push('AFE: ' + form.afeAlarm.replace(/_/g, ' '));
+      }
+
+      // Missing parts → warranty triggers
+      var mp = form.missingParts || [];
+      if (mp.indexOf('cells')        !== -1) warrant.push('Stolen / missing cells');
+      if (mp.indexOf('bms_board')    !== -1) warrant.push('Missing BMS board');
+      if (mp.indexOf('iot_device')   !== -1) warrant.push('Missing IoT device');
+      if (mp.indexOf('wire_harness') !== -1) warrant.push('Missing wire harness');
+
+      // Physical damage → warranty triggers
+      var pd = form.physicalDamage || [];
+      var severeVals = ['fc_destroyed', 'bc_destroyed', 'burn'];
+      var hasSevere  = pd.some(function (d) { return severeVals.indexOf(d) !== -1; });
+      if (hasSevere) warrant.push('Severe physical damage / vandalism');
+
+      if (warrant.length > 0) return { cat: 'WARRANTY', issues: issues.concat(warrant) };
+      if (issues.length  > 0) return { cat: 'REPAIR',   issues: issues };
+      return                          { cat: 'OK',       issues: [] };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXCEL EXPORT
+    // ═══════════════════════════════════════════════════════════════════════════
+    function exportToExcel(batteries) {
+      if (!window.XLSX) { alert('Excel library not loaded. Check internet connection.'); return; }
+      var wb = window.XLSX.utils.book_new();
+      var cats = { OK: [], REPAIR: [], WARRANTY: [] };
+      batteries.forEach(function (b) {
+        var cat = b.route && b.route.cat ? b.route.cat : 'REPAIR';
+        if (cats[cat]) cats[cat].push(b);
+      });
+      var sheetNames = { OK: 'OK – Charging', REPAIR: 'Incoming – Repair', WARRANTY: 'Warranty – Parts' };
+      Object.keys(cats).forEach(function (cat) {
+        var rows = cats[cat].map(function (b) {
+          var f = b.form || {};
+          return {
+            'Timestamp':       b.timestamp   || '',
+            'Serial Number':   b.serial      || '',
+            'Battery Type':    b.batteryType || '',
+            'Technician':      b.technician  || '',
+            'Cell V Min (V)':  f.cellVoltageMin || '',
+            'Cell V Max (V)':  f.cellVoltageMax || '',
+            'Cell Delta (mV)': (f.cellVoltageMin && f.cellVoltageMax)
+              ? ((parseFloat(f.cellVoltageMax) - parseFloat(f.cellVoltageMin)) * 1000).toFixed(0) : '',
+            'Pack Voltage (V)': f.packVoltage || '',
+            'T1 (°C)': f.t1 || '', 'T2 (°C)': f.t2 || '', 'T3 (°C)': f.t3 || '', 'T4 (°C)': f.t4 || '',
+            'MOSFET Status':    f.mosfetStatus || '',
+            'AFE Alarm':        f.afeAlarm     ? f.afeAlarm.replace(/_/g,' ')   : '',
+            'Can Charge':       f.canCharge    || '',
+            'Can Discharge':    f.canDischarge || '',
+            'LED Pattern':      f.ledPattern   ? f.ledPattern.replace(/_/g,' ') : '',
+            'Missing Parts':   (f.missingParts  || []).join('; '),
+            'Physical Damage': (f.physicalDamage || []).join('; '),
+            'Missing Bolts':    f.missingBoltCount || '',
+            'Missing Cells':    f.missingCellCount || '',
+            'Issues Flagged':  (b.route && b.route.issues ? b.route.issues : []).join('; '),
+            'Observations':     f.observations || '',
+            'Route':            cat,
+          };
+        });
+        if (rows.length === 0) rows.push({});
+        var ws = window.XLSX.utils.json_to_sheet(rows);
+        ws['!cols'] = Array(24).fill({ wch: 18 });
+        window.XLSX.utils.book_append_sheet(wb, ws, sheetNames[cat]);
+      });
+      // Summary sheet
+      var summary = [
+        { Category: 'Incoming – OK for Charging', Count: cats.OK.length },
+        { Category: 'Incoming – Repair',          Count: cats.REPAIR.length },
+        { Category: 'Warranty – Spare Parts',     Count: cats.WARRANTY.length },
+        { Category: 'TOTAL',                      Count: batteries.length },
+      ];
+      window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.json_to_sheet(summary), 'Summary');
+      var date = new Date().toISOString().slice(0, 10);
+      window.XLSX.writeFile(wb, 'Spiro_BatteryQMS_' + date + '.xlsx');
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STYLE TOKENS
+    // ═══════════════════════════════════════════════════════════════════════════
+    var C = {
+      navy:    '#0D1B3E',
+      blue:    '#1565C0',
+      sky:     '#42A5F5',
+      green:   '#1B7A3E',
+      amber:   '#E65100',
+      red:     '#B71C1C',
+      surface: '#F4F6FB',
+      border:  '#DDE3EE',
+      muted:   '#6B7280',
+      text:    '#1A1F36',
+    };
+
+    var RS = {
+      OK:       { bg: '#E8F5E9', bdr: '#1B7A3E', tx: '#1B7A3E', ic: '✅', lb: 'Incoming – OK for Charging' },
+      REPAIR:   { bg: '#E3F2FD', bdr: '#1565C0', tx: '#1565C0', ic: '🔧', lb: 'Incoming – Repair' },
+      WARRANTY: { bg: '#FFEBEE', bdr: '#B71C1C', tx: '#B71C1C', ic: '⚠️',  lb: 'Warranty – Spare Parts' },
+    };
+
+    var inp = {
+      width: '100%', padding: '9px 11px', borderRadius: 7,
+      border: '1.5px solid ' + C.border, fontSize: 14,
+      fontFamily: 'inherit', background: '#fff',
+      boxSizing: 'border-box', color: C.text,
+    };
+    var card = {
+      background: '#fff', borderRadius: 12, padding: '15px',
+      marginBottom: 12, boxShadow: '0 1px 4px rgba(0,0,0,0.07)',
+      border: '1px solid ' + C.border,
+    };
+    var sh = {
+      fontSize: 11, fontWeight: 700, color: C.muted,
+      textTransform: 'uppercase', letterSpacing: 1,
+      marginBottom: 10, paddingBottom: 5,
+      borderBottom: '1px solid ' + C.border,
+    };
+    var fl = {
+      display: 'block', fontSize: 12, fontWeight: 600,
+      color: C.muted, marginBottom: 4,
+      textTransform: 'uppercase', letterSpacing: 0.4,
+    };
+
+    function btn(bg, co, bd) {
+      co = co || '#fff';
+      return {
+        padding: '10px 16px', borderRadius: 8,
+        border: bd ? '1.5px solid ' + bd : 'none',
+        background: bg, color: co, fontWeight: 700,
+        fontSize: 13, cursor: 'pointer', fontFamily: 'inherit',
+      };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPONENT: QR SCANNER
+    // ═══════════════════════════════════════════════════════════════════════════
+    function QRScanner(props) {
+      var onScan  = props.onScan;
+      var onClose = props.onClose;
+      var vRef = useRef(null), cRef = useRef(null), sRef = useRef(null), rRef = useRef(null);
+      var statusState = useState('Loading camera…');
+      var status = statusState[0], setStatus = statusState[1];
+
+      useEffect(function () {
+        var active = true;
+
+        function loadJsQR() {
+          return new Promise(function (resolve, reject) {
+            if (window.jsQR) { resolve(); return; }
+            var sc = document.createElement('script');
+            sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js';
+            sc.onload = resolve;
+            sc.onerror = function () { reject(new Error('jsQR failed to load')); };
+            document.head.appendChild(sc);
+          });
+        }
+
+        loadJsQR().then(function () {
+          return navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        }).then(function (stream) {
+          if (!active) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+          sRef.current = stream;
+          vRef.current.srcObject = stream;
+          return vRef.current.play();
+        }).then(function () {
+          setStatus('Point camera at barcode or QR code');
+          function scan() {
+            if (!active) return;
+            var v = vRef.current, c = cRef.current;
+            if (v && c && v.readyState === v.HAVE_ENOUGH_DATA) {
+              c.width = v.videoWidth; c.height = v.videoHeight;
+              var ctx = c.getContext('2d');
+              ctx.drawImage(v, 0, 0);
+              var img  = ctx.getImageData(0, 0, c.width, c.height);
+              var code = window.jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+              if (code && code.data) { onScan(code.data); return; }
+            }
+            rRef.current = requestAnimationFrame(scan);
+          }
+          rRef.current = requestAnimationFrame(scan);
+        }).catch(function () {
+          setStatus('Camera access denied — use manual entry.');
+        });
+
+        return function () {
+          active = false;
+          cancelAnimationFrame(rRef.current);
+          if (sRef.current) sRef.current.getTracks().forEach(function (t) { t.stop(); });
+        };
+      }, []);
+
+      return h('div', { style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.95)', zIndex: 2000, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' } },
+        h('p',   { style: { color: '#fff', fontSize: 13, marginBottom: 12, opacity: 0.8 } }, status),
+        h('div', { style: { position: 'relative', width: 'min(90vw,340px)', aspectRatio: '1', borderRadius: 16, overflow: 'hidden', border: '3px solid ' + C.sky } },
+          h('video',  { ref: vRef, style: { width: '100%', height: '100%', objectFit: 'cover' }, playsInline: true, muted: true }),
+          h('canvas', { ref: cRef, style: { display: 'none' } }),
+          h('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' } },
+            h('div', { style: { width: '60%', height: '60%', border: '2.5px solid ' + C.sky, borderRadius: 10, boxShadow: '0 0 0 9999px rgba(0,0,0,0.5)' } }))),
+        h('button', { onClick: onClose, style: { marginTop: 20, padding: '10px 28px', borderRadius: 24, background: '#ef5350', color: '#fff', border: 'none', fontWeight: 700, fontSize: 15, cursor: 'pointer' } }, '✕ Cancel'));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPONENT: CHECKBOX GROUP
+    // ═══════════════════════════════════════════════════════════════════════════
+    function Checks(props) {
+      var opts     = props.opts;
+      var val      = props.val || [];
+      var onChange = props.onChange;
+      var cols     = props.cols || 2;
+
+      function toggle(v) {
+        if (val.indexOf(v) !== -1) {
+          onChange(val.filter(function (x) { return x !== v; }));
+        } else {
+          onChange(val.concat([v]));
+        }
+      }
+
+      return h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(' + cols + ',1fr)', gap: '6px 10px' } },
+        opts.map(function (o) {
+          return h('label', { key: o.v, style: { display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 13, cursor: 'pointer', lineHeight: 1.35 } },
+            h('input', { type: 'checkbox', checked: val.indexOf(o.v) !== -1, onChange: function () { toggle(o.v); }, style: { marginTop: 2, accentColor: C.blue, flexShrink: 0 } }),
+            h('span', null, o.l));
+        }));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPONENT: SOP GUIDE PANEL (shown after scan result)
+    // ═══════════════════════════════════════════════════════════════════════════
+    function SOPPanel(props) {
+      var issues = props.issues || [];
+      var openState = useState(null);
+      var open = openState[0], setOpen = openState[1];
+
+      var relevant = getRelevantSOPs(issues);
+      if (relevant.length === 0) return null;
+
+      return h('div', { style: Object.assign({}, card, { background: '#FFFDE7', border: '1.5px solid #F9A825', marginTop: 10 }) },
+        h('div', { style: Object.assign({}, sh, { color: C.amber, borderColor: '#FBBC04' }) }, '🔬 SOP Troubleshooting Guides'),
+        h('p',   { style: { fontSize: 12, color: '#5D4037', marginBottom: 10 } }, 'Based on issues detected — tap any to expand:'),
+        relevant.map(function (key) {
+          var g = SOP[key];
+          if (!g) return null;
+          var isOpen = open === key;
+
+          // Determine route badge style
+          var routeCat = g.route.indexOf('WARRANTY') !== -1 ? 'WARRANTY' : g.route.indexOf('REPAIR') !== -1 ? 'REPAIR' : 'OK';
+          var routeStyle = RS[routeCat];
+
+          return h('div', { key: key, style: { marginBottom: 8, borderRadius: 8, border: '1px solid ' + (isOpen ? C.amber : C.border), overflow: 'hidden' } },
+            h('button', {
+              onClick: function () { setOpen(isOpen ? null : key); },
+              style: { width: '100%', padding: '10px 12px', background: isOpen ? '#FFF8E1' : '#fff', border: 'none', textAlign: 'left', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontFamily: 'inherit' },
+            },
+              h('span', { style: { fontWeight: 700, fontSize: 13, color: C.navy } }, g.title),
+              h('span', { style: { fontSize: 18, color: C.amber } }, isOpen ? '▲' : '▼')),
+            isOpen && h('div', { style: { padding: '12px', background: '#FFFDE7', borderTop: '1px solid ' + C.border } },
+              h('div', { style: { fontSize: 12, color: '#5D4037', marginBottom: 10, padding: '7px 10px', background: 'rgba(230,81,0,0.08)', borderRadius: 6, lineHeight: 1.6 } },
+                h('strong', null, 'Root Cause: '), g.cause),
+              h('div', { style: { fontWeight: 700, fontSize: 12, color: C.navy, marginBottom: 8 } }, 'Step-by-Step Procedure:'),
+              g.steps.map(function (step, i) {
+                return h('div', { key: i, style: { display: 'flex', gap: 8, marginBottom: 8, fontSize: 12, lineHeight: 1.5 } },
+                  h('div', { style: { background: C.blue, color: '#fff', borderRadius: '50%', width: 20, height: 20, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, flexShrink: 0, marginTop: 1 } }, i + 1),
+                  h('div', { style: { color: C.text } }, step));
+              }),
+              h('div', { style: { marginBottom: 8 } },
+                h('span', { style: { fontSize: 11, padding: '2px 9px', borderRadius: 10, background: routeStyle.bg, color: routeStyle.tx, border: '1px solid ' + routeStyle.bdr, fontWeight: 700 } }, '📍 ' + g.route)),
+              h('div', { style: { fontSize: 12, color: C.red, background: '#FFEBEE', padding: '7px 10px', borderRadius: 6, lineHeight: 1.5 } },
+                '⚠️ ', h('strong', null, 'WARNING: '), g.warning)));
+        }));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPONENT: SYNC BADGE
+    // ═══════════════════════════════════════════════════════════════════════════
+    function SyncBadge(props) {
+      var status = props.status;
+      var errMsg = props.errMsg;
+      var map = {
+        idle:    { bg: '#E3F2FD', bdr: C.blue,  tx: C.blue,  ic: '☁️', lb: 'Ready to sync' },
+        syncing: { bg: '#FFF8E1', bdr: C.amber, tx: C.amber, ic: '⏳', lb: 'Syncing to OneDrive…' },
+        ok:      { bg: '#E8F5E9', bdr: C.green, tx: C.green, ic: '✅', lb: 'Saved to OneDrive' },
+        error:   { bg: '#FFEBEE', bdr: C.red,   tx: C.red,   ic: '❌', lb: errMsg || 'Sync failed — data saved locally' },
+      };
+      var m = map[status] || map.idle;
+      return h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', borderRadius: 20, background: m.bg, border: '1px solid ' + m.bdr, fontSize: 12, color: m.tx, fontWeight: 600 } },
+        h('span', null, m.ic),
+        h('span', { style: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, m.lb));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MAIN APP COMPONENT
+    // ═══════════════════════════════════════════════════════════════════════════
+    function App() {
+      // Auth
+      var ts = useState(null);          var tech = ts[0],    setTech    = ts[1];
+      var ns = useState('');            var lname = ns[0],   setLname   = ns[1];
+      var ps = useState('');            var lpin  = ps[0],   setLpin    = ps[1];
+      var es = useState('');            var lerr  = es[0],   setLerr    = es[1];
+
+      // Navigation
+      var vs = useState('scan');        var view  = vs[0],   setView    = vs[1];
+
+      // Scan state
+      var ss = useState('');            var serial   = ss[0], setSerial   = ss[1];
+      var ms = useState('');            var mtype    = ms[0], setMtype    = ms[1];
+      var bs = useState(null);          var bat      = bs[0], setBat      = bs[1];
+      var fs = useState({});            var form     = fs[0], setForm     = fs[1];
+      var us = useState(null);          var sub      = us[0], setSub      = us[1];
+      var cs = useState(false);         var scanning = cs[0], setScanning = cs[1];
+
+      // Sync state
+      var yc = useState('idle');        var syncSt  = yc[0], setSyncSt  = yc[1];
+      var ye = useState('');            var syncErr = ye[0], setSyncErr = ye[1];
+
+      // Data
+      var db1 = useState(ldb.allBatteries()); var bats = db1[0], setBats = db1[1];
+      var db2 = useState(ldb.allRepairs());   var reps = db2[0], setReps = db2[1];
+
+      // UI state
+      var rm = useState(null);          var repMod  = rm[0], setRepMod  = rm[1];
+      var rf = useState({});            var repForm = rf[0], setRepForm = rf[1];
+      var qs = useState('');            var q       = qs[0], setQ       = qs[1];
+      var fc = useState('ALL');         var fcat    = fc[0], setFcat    = fc[1];
+      var sv = useState(null);          var sopView = sv[0], setSopView = sv[1];
+
+      var refresh = useCallback(function () {
+        setBats(ldb.allBatteries());
+        setReps(ldb.allRepairs());
+      }, []);
+
+      // Listen for background sync retry
+      useEffect(function () {
+        function onRetry() {
+          if (sub && syncSt === 'error' && isConfigured()) {
+            setSyncSt('syncing');
+            syncEntryToOneDrive(sub)
+              .then(function () { setSyncSt('ok'); })
+              .catch(function (e) { setSyncSt('error'); setSyncErr(e.message); });
+          }
+        }
+        window.addEventListener('spiro:retry-sync', onRetry);
+        return function () { window.removeEventListener('spiro:retry-sync', onRetry); };
+      }, [sub, syncSt]);
+
+      // ── Login ──────────────────────────────────────────────────────────────
+      function doLogin() {
+        var found = TECHS.filter(function (t) {
+          return t.name.toLowerCase().indexOf(lname.toLowerCase()) !== -1 && t.pin === lpin;
+        })[0];
+        if (found) { setTech(found); setLerr(''); }
+        else { setLerr('Name or PIN not recognised. Try again.'); }
+      }
+
+      // ── Serial detection ───────────────────────────────────────────────────
+      var detect = useCallback(function (raw) {
+        var s = raw.trim().toUpperCase();
+        setSerial(s);
+        setSub(null);
+        var found = null;
+        Object.keys(BT).forEach(function (k) {
+          if (!found && s.indexOf(BT[k].prefix) === 0 && s.length === BT[k].len) {
+            found = Object.assign({ key: k }, BT[k]);
+          }
+        });
+        if (found) { setBat(found); setMtype(''); setForm({}); return; }
+        if (mtype && BT[mtype] && s.length === BT[mtype].len) {
+          setBat(Object.assign({ key: mtype }, BT[mtype])); setForm({}); return;
+        }
+        setBat(null);
+      }, [mtype]);
+
+      function pickType(k) {
+        setMtype(k); setSub(null); setForm({});
+        if (serial && BT[k] && serial.length === BT[k].len) {
+          setBat(Object.assign({ key: k }, BT[k]));
+        } else { setBat(null); }
+      }
+
+      function sf(id, val) { setForm(function (p) { var n = Object.assign({}, p); n[id] = val; return n; }); }
+
+      // ── Submit inspection ──────────────────────────────────────────────────
+      async function submit() {
+        if (!bat || !serial) return;
+        if (!form.packVoltage) { alert('Pack voltage is required.'); return; }
+        var r = routeBattery(form);
+        var entry = {
+          id:          Date.now().toString(),
+          timestamp:   new Date().toLocaleString('en-UG'),
+          serial:      serial,
+          batteryType: bat.name,
+          batteryKey:  bat.key,
+          technician:  tech ? tech.name : 'Unknown',
+          form:        Object.assign({}, form),
+          route:       r,
+        };
+        ldb.insertBattery(entry);
+        refresh();
+        setSub(entry);
+        setSyncSt('idle');
+        setSyncErr('');
+
+        if (isConfigured()) {
+          setSyncSt('syncing');
+          try {
+            await syncEntryToOneDrive(entry);
+            setSyncSt('ok');
+          } catch (e) {
+            setSyncSt('error');
+            setSyncErr(e.message);
+            if (window.registerBgSync) window.registerBgSync();
+          }
+        }
+      }
+
+      function nextBattery() {
+        setSerial(''); setBat(null); setForm({}); setSub(null); setMtype('');
+        setSyncSt('idle'); setSyncErr('');
+      }
+
+      // ── Derived data ───────────────────────────────────────────────────────
+      var counts = useMemo(function () {
+        return {
+          OK:       bats.filter(function (b) { return b.route && b.route.cat === 'OK'; }).length,
+          REPAIR:   bats.filter(function (b) { return b.route && b.route.cat === 'REPAIR'; }).length,
+          WARRANTY: bats.filter(function (b) { return b.route && b.route.cat === 'WARRANTY'; }).length,
+        };
+      }, [bats]);
+
+      var typeCounts = useMemo(function () {
+        var tc = { C: 0, U: 0, A: 0, D: 0 };
+        bats.forEach(function (b) { if (tc[b.batteryKey] !== undefined) tc[b.batteryKey]++; });
+        return tc;
+      }, [bats]);
+
+      var filtered = useMemo(function () {
+        return bats.filter(function (b) {
+          var catOk  = fcat === 'ALL' || (b.route && b.route.cat === fcat);
+          var searchOk = !q || (b.serial && b.serial.indexOf(q.toUpperCase()) !== -1)
+            || (b.batteryType && b.batteryType.toLowerCase().indexOf(q.toLowerCase()) !== -1)
+            || (b.technician  && b.technician.toLowerCase().indexOf(q.toLowerCase()) !== -1);
+          return catOk && searchOk;
+        });
+      }, [bats, fcat, q]);
+
+      var nav = [
+        { id: 'scan',      ic: '⚡', lb: 'Scan'      },
+        { id: 'dashboard', ic: '📊', lb: 'Dashboard' },
+        { id: 'log',       ic: '📋', lb: 'Log'       },
+        { id: 'repairs',   ic: '🔧', lb: 'Repairs'   },
+        { id: 'search',    ic: '🔍', lb: 'Search'    },
+        { id: 'sop',       ic: '📖', lb: 'SOP'       },
+      ];
+
+      // ══════════════════════════════════════════════════════════════════════
+      // LOGIN SCREEN
+      // ══════════════════════════════════════════════════════════════════════
+      if (!tech) {
+        return h('div', { style: { minHeight: '100vh', background: C.navy, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 } },
+          h('div', { style: { background: '#fff', borderRadius: 16, padding: '36px 28px', width: 'min(92vw,360px)', boxShadow: '0 20px 60px rgba(0,0,0,0.4)' } },
+            h('div', { style: { textAlign: 'center', marginBottom: 24 } },
+              h('div', { style: { fontSize: 44, marginBottom: 8 } }, '⚡'),
+              h('div', { style: { fontSize: 22, fontWeight: 800, color: C.navy } }, 'Spiro Battery QMS'),
+              h('div', { style: { fontSize: 12, color: C.muted, marginTop: 4 } }, 'Battery Quality Management System')),
+            h('label', { style: fl }, 'Your Name'),
+            h('input', { style: Object.assign({}, inp, { marginBottom: 12 }), placeholder: 'e.g. Dennis', value: lname, onChange: function (e) { setLname(e.target.value); } }),
+            h('label', { style: fl }, 'PIN'),
+            h('input', { type: 'password', style: Object.assign({}, inp, { marginBottom: 16 }), placeholder: '4-digit PIN', maxLength: 4, value: lpin, onChange: function (e) { setLpin(e.target.value); }, onKeyDown: function (e) { if (e.key === 'Enter') doLogin(); } }),
+            lerr && h('div', { style: { color: C.red, fontSize: 13, marginBottom: 10 } }, lerr),
+            h('button', { style: Object.assign({}, btn(C.navy), { width: '100%', padding: 13, fontSize: 15 }), onClick: doLogin }, 'Sign In →'),
+            h('div', { style: { marginTop: 12, fontSize: 11, color: C.muted, textAlign: 'center' } }, 'Demo: Dennis→1234 · Alpha→2222 · Beta→3333')));
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // MAIN LAYOUT
+      // ══════════════════════════════════════════════════════════════════════
+      return h('div', { style: { fontFamily: 'inherit', minHeight: '100vh', background: C.surface, color: C.text, paddingBottom: 76 } },
+
+        // ── Header ──────────────────────────────────────────────────────────
+        h('div', { style: { background: C.navy, color: '#fff', padding: '11px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 100, boxShadow: '0 2px 12px rgba(0,0,0,0.3)' } },
+          h('div', null,
+            h('div', { style: { fontSize: 16, fontWeight: 800 } }, '⚡ Spiro Battery QMS'),
+            h('div', { style: { fontSize: 11, opacity: 0.6, marginTop: 1 } }, tech.name, ' · ', tech.role)),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            !isConfigured() && h('span', { style: { fontSize: 10, background: '#F9A825', color: '#fff', padding: '2px 8px', borderRadius: 10, fontWeight: 700 } }, 'Offline Mode'),
+            h('button', { onClick: function () { setTech(null); }, style: { background: 'rgba(255,255,255,0.12)', border: 'none', color: '#fff', padding: '5px 10px', borderRadius: 20, fontSize: 11, cursor: 'pointer' } }, 'Sign out'))),
+
+        // ── Body ────────────────────────────────────────────────────────────
+        h('div', { style: { maxWidth: 640, margin: '0 auto', padding: '12px 11px' } },
+
+          // ════════════════════ SCAN VIEW ════════════════════
+          view === 'scan' && h(Fragment, null,
+            scanning && h(QRScanner, { onScan: function (sc) { setScanning(false); detect(sc); }, onClose: function () { setScanning(false); } }),
+
+            !sub && h(Fragment, null,
+              // ID card
+              h('div', { style: card },
+                h('div', { style: sh }, 'Battery Identification'),
+                // Type selector buttons
+                h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 6, marginBottom: 13 } },
+                  Object.keys(BT).map(function (k) {
+                    var bt2 = BT[k];
+                    var active = bat ? bat.key === k : mtype === k;
+                    return h('button', {
+                      key: k, onClick: function () { pickType(k); },
+                      style: { padding: '8px 4px', borderRadius: 8, cursor: 'pointer', textAlign: 'center', fontWeight: 700, fontSize: 12, border: '2px solid ' + (active ? bt2.color : C.border), background: active ? bt2.light : '#fff', color: active ? bt2.color : C.muted },
+                    }, bt2.name);
+                  })),
+                h('label', { style: fl }, 'Serial Number'),
+                h('div', { style: { display: 'flex', gap: 8 } },
+                  h('input', { style: Object.assign({}, inp, { flex: 1, fontSize: 15, letterSpacing: 0.8 }), value: serial, placeholder: 'Scan or type serial number…', onChange: function (e) { detect(e.target.value); } }),
+                  h('button', { onClick: function () { setScanning(true); }, style: { padding: '9px 13px', borderRadius: 8, background: C.sky, border: 'none', fontSize: 18, cursor: 'pointer' }, title: 'Scan QR / Barcode' }, '📷')),
+                serial && !bat && serial.length > 5 && h('div', { style: { marginTop: 8, fontSize: 12, color: C.amber, background: '#FFF8E1', padding: '6px 10px', borderRadius: 6 } }, '⚠️ Not auto-detected. Select battery type above or check serial length (all = 18 chars).'),
+                bat && h('div', { style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 } },
+                  h('span', { style: { background: bat.light, color: bat.color, border: '1px solid ' + bat.color, borderRadius: 10, padding: '2px 10px', fontSize: 12, fontWeight: 700 } }, '● ', bat.name),
+                  h('span', { style: { fontSize: 12, color: C.muted } }, serial.length, '/', bat.len, ' chars ✓'))),
+
+              // Inspection form
+              bat && h('div', { style: card },
+
+                // Voltages
+                h('div', { style: sh }, 'Electrical Measurements'),
+                h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 } },
+                  h('div', null,
+                    h('label', { style: fl }, 'Cell V Min (V)'),
+                    h('input', { style: inp, type: 'number', step: '0.001', placeholder: 'e.g. 3.280', value: form.cellVoltageMin || '', onChange: function (e) { sf('cellVoltageMin', e.target.value); } }),
+                    form.cellVoltageMin && parseFloat(form.cellVoltageMin) < 2.6 && h('div', { style: { color: C.red, fontSize: 11, marginTop: 2 } }, '⚠️ Below 2.6V threshold!')),
+                  h('div', null,
+                    h('label', { style: fl }, 'Cell V Max (V)'),
+                    h('input', { style: inp, type: 'number', step: '0.001', placeholder: 'e.g. 3.750', value: form.cellVoltageMax || '', onChange: function (e) { sf('cellVoltageMax', e.target.value); } }))),
+                form.cellVoltageMin && form.cellVoltageMax && (function () {
+                  var delta = (parseFloat(form.cellVoltageMax) - parseFloat(form.cellVoltageMin)) * 1000;
+                  return h('div', { style: { fontSize: 12, marginBottom: 10, padding: '6px 10px', borderRadius: 6, background: delta > 500 ? '#FFEBEE' : '#E8F5E9', color: delta > 500 ? C.red : C.green } },
+                    'Cell Δ = ', delta.toFixed(0), ' mV ', delta > 500 ? '— EXCEEDS 500mV limit → REPAIR' : '— Within acceptable limit ✓');
+                })(),
+                h('label', { style: fl }, 'Pack Voltage (V) *'),
+                h('input', { style: Object.assign({}, inp, { marginBottom: 14 }), type: 'number', step: '0.1', placeholder: 'e.g. 48.5', value: form.packVoltage || '', onChange: function (e) { sf('packVoltage', e.target.value); } }),
+
+                // Temperatures
+                h('div', { style: sh }, '🌡 Temperatures (°C)'),
+                h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 7, marginBottom: 14 } },
+                  ['t1','t2','t3','t4'].map(function (t, i) {
+                    return h('div', { key: t },
+                      h('label', { style: Object.assign({}, fl, { fontSize: 11 }) }, 'T' + (i+1)),
+                      h('input', { style: Object.assign({}, inp, { textAlign: 'center' }), type: 'number', step: '0.1', value: form[t] || '', onChange: function (e) { sf(t, e.target.value); } }),
+                      form[t] && parseFloat(form[t]) > 45 && h('div', { style: { color: C.red, fontSize: 10 } }, 'HIGH!'));
+                  })),
+
+                // BMS Status
+                h('div', { style: sh }, '⚙️ BMS / Functional Status'),
+                h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 } },
+                  h('div', null,
+                    h('label', { style: fl }, 'MOSFET Status'),
+                    h('select', { style: inp, value: form.mosfetStatus || '', onChange: function (e) { sf('mosfetStatus', e.target.value); } },
+                      h('option', { value: '' }, '— select —'),
+                      ['OK','Fault – CHG side','Fault – DSG side','Fault – Both','Unknown'].map(function (o) { return h('option', { key: o }, o); }))),
+                  h('div', null,
+                    h('label', { style: fl }, 'AFE Alarm'),
+                    h('select', { style: inp, value: form.afeAlarm || '', onChange: function (e) { sf('afeAlarm', e.target.value); } },
+                      AFE.map(function (a) { return h('option', { key: a.v, value: a.v }, a.l); }))),
+                  h('div', null,
+                    h('label', { style: fl }, 'Can Charge?'),
+                    h('select', { style: inp, value: form.canCharge || '', onChange: function (e) { sf('canCharge', e.target.value); } },
+                      h('option', { value: '' }, '—'), h('option', null, 'Yes'), h('option', null, 'No'))),
+                  h('div', null,
+                    h('label', { style: fl }, 'Can Discharge?'),
+                    h('select', { style: inp, value: form.canDischarge || '', onChange: function (e) { sf('canDischarge', e.target.value); } },
+                      h('option', { value: '' }, '—'), h('option', null, 'Yes'), h('option', null, 'No')))),
+
+                // LED pattern
+                h('label', { style: fl }, 'LED Pattern — ' + bat.name),
+                h('select', { style: Object.assign({}, inp, { marginBottom: 14 }), value: form.ledPattern || '', onChange: function (e) { sf('ledPattern', e.target.value); } },
+                  h('option', { value: '' }, '— what do you see? —'),
+                  (LED[bat.key] || []).map(function (p) { return h('option', { key: p.v, value: p.v }, p.l); })),
+
+                // Physical condition
+                h('div', { style: sh }, '🔩 Physical Condition'),
+                h('label', { style: fl }, 'Missing Parts'),
+                h(Checks, { opts: MISSING, val: form.missingParts || [], onChange: function (v) { sf('missingParts', v); } }),
+                form.missingParts && form.missingParts.indexOf('bolts') !== -1 && h('div', { style: { marginTop: 8 } },
+                  h('label', { style: fl }, 'Missing Bolt Count'),
+                  h('input', { style: inp, type: 'number', min: 0, value: form.missingBoltCount || '', onChange: function (e) { sf('missingBoltCount', e.target.value); } })),
+                form.missingParts && form.missingParts.indexOf('cells') !== -1 && h('div', { style: { marginTop: 8 } },
+                  h('label', { style: fl }, 'Stolen / Missing Cell Count'),
+                  h('input', { style: inp, type: 'number', min: 0, value: form.missingCellCount || '', onChange: function (e) { sf('missingCellCount', e.target.value); } })),
+                h('label', { style: Object.assign({}, fl, { marginTop: 14 }) }, 'Physical Damage'),
+                h(Checks, { opts: DAMAGE, val: form.physicalDamage || [], onChange: function (v) { sf('physicalDamage', v); } }),
+
+                // Type-specific fields
+                bat.key === 'C' && h(Fragment, null,
+                  h('div', { style: Object.assign({}, sh, { marginTop: 14 }) }, '🔵 CBAK-Specific'),
+                  h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
+                    h('div', null,
+                      h('label', { style: fl }, 'BMS FW Version'),
+                      h('select', { style: inp, value: form.bmsVersion || '', onChange: function (e) { sf('bmsVersion', e.target.value); } },
+                        h('option', { value: '' }, '—'),
+                        ['B2.3','B2.4','B2.5','B2.6','B2.7'].map(function (v) { return h('option', { key: v }, v); }))),
+                    h('div', null,
+                      h('label', { style: fl }, 'Air Leak Test (kPa)'),
+                      h('input', { style: inp, type: 'number', step: '0.1', placeholder: '4.1–4.3 kPa OK', value: form.airLeakKpa || '', onChange: function (e) { sf('airLeakKpa', e.target.value); } })))),
+
+                bat.key === 'U' && h(Fragment, null,
+                  h('div', { style: Object.assign({}, sh, { marginTop: 14 }) }, '🟢 Unique-Specific'),
+                  h('label', { style: fl }, 'Cell Configuration'),
+                  h('select', { style: inp, value: form.cellConfig || '', onChange: function (e) { sf('cellConfig', e.target.value); } },
+                    h('option', { value: '' }, '—'),
+                    ['14S4P','14S3P','Other'].map(function (o) { return h('option', { key: o }, o); }))),
+
+                bat.key === 'A' && h(Fragment, null,
+                  h('div', { style: Object.assign({}, sh, { marginTop: 14 }) }, '🟠 Ampace-Specific'),
+                  h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
+                    h('div', null,
+                      h('label', { style: fl }, 'BMS Communication'),
+                      h('select', { style: inp, value: form.bmsComms || '', onChange: function (e) { sf('bmsComms', e.target.value); } },
+                        h('option', { value: '' }, '—'),
+                        ['OK','No Comms','Intermittent'].map(function (o) { return h('option', { key: o }, o); }))),
+                    h('div', null,
+                      h('label', { style: fl }, 'Cell Balancing'),
+                      h('select', { style: inp, value: form.balancing || '', onChange: function (e) { sf('balancing', e.target.value); } },
+                        h('option', { value: '' }, '—'),
+                        ['Active','Inactive','Unknown'].map(function (o) { return h('option', { key: o }, o); }))))),
+
+                bat.key === 'D' && h(Fragment, null,
+                  h('div', { style: Object.assign({}, sh, { marginTop: 14 }) }, '🟣 Greenway-Specific'),
+                  h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
+                    h('div', null,
+                      h('label', { style: fl }, 'Case Condition'),
+                      h('select', { style: inp, value: form.caseCondition || '', onChange: function (e) { sf('caseCondition', e.target.value); } },
+                        h('option', { value: '' }, '—'),
+                        ['Good','Cracked','Dented','Burnt'].map(function (o) { return h('option', { key: o }, o); }))),
+                    h('div', null,
+                      h('label', { style: fl }, 'Label / Sticker'),
+                      h('select', { style: inp, value: form.labelIntact || '', onChange: function (e) { sf('labelIntact', e.target.value); } },
+                        h('option', { value: '' }, '—'),
+                        ['Intact','Faded','Missing'].map(function (o) { return h('option', { key: o }, o); }))))),
+
+                // Observations
+                h('div', { style: Object.assign({}, sh, { marginTop: 14 }) }, '📝 Observations'),
+                h('textarea', { rows: 3, style: Object.assign({}, inp, { resize: 'vertical' }), placeholder: 'Anything not captured above — describe what you see…', value: form.observations || '', onChange: function (e) { sf('observations', e.target.value); } }),
+
+                h('button', { style: Object.assign({}, btn(C.navy), { width: '100%', padding: 14, fontSize: 15, marginTop: 14 }), onClick: submit }, 'Submit & Sync to OneDrive →'))),
+
+            // Scan result
+            sub && (function () {
+              var rs  = RS[sub.route.cat] || RS.REPAIR;
+              var bt2 = BT[sub.batteryKey] || {};
+              return h(Fragment, null,
+                h('div', { style: Object.assign({}, card, { border: '2.5px solid ' + rs.bdr, background: rs.bg }) },
+                  h('div', { style: { fontSize: 32, marginBottom: 5 } }, rs.ic),
+                  h('div', { style: { fontSize: 20, fontWeight: 800, color: rs.tx } }, rs.lb),
+                  h('div', { style: { fontSize: 13, color: C.muted, marginTop: 3 } }, sub.serial),
+                  h('span', { style: { background: bt2.light, color: bt2.color, border: '1px solid ' + bt2.color, borderRadius: 10, padding: '2px 10px', fontSize: 12, fontWeight: 700, display: 'inline-block', marginTop: 6 } }, bt2.name),
+                  h('div', { style: { marginTop: 10 } },
+                    h(SyncBadge, { status: syncSt, errMsg: syncErr }),
+                    syncSt === 'error' && h('button', {
+                      onClick: async function () {
+                        setSyncSt('syncing');
+                        try { await syncEntryToOneDrive(sub); setSyncSt('ok'); }
+                        catch (e) { setSyncSt('error'); setSyncErr(e.message); }
+                      },
+                      style: Object.assign({}, btn(C.amber), { marginTop: 6, fontSize: 12, padding: '5px 12px' }),
+                    }, '🔄 Retry sync')),
+                  sub.route.issues.length > 0
+                    ? h('div', { style: { marginTop: 10 } },
+                        h('div', { style: { fontSize: 12, fontWeight: 700, color: rs.tx, marginBottom: 5 } }, 'Issues detected:'),
+                        sub.route.issues.map(function (iss, i) {
+                          return h('div', { key: i, style: { fontSize: 12, padding: '4px 10px', marginBottom: 3, background: '#fff', borderRadius: 8, border: '1px solid ' + rs.bdr, color: rs.tx } }, '• ', iss);
+                        }))
+                    : h('div', { style: { marginTop: 8, fontSize: 13, color: C.green } }, 'All parameters within spec. Ready for charging queue. ✓'),
+                  h('div', { style: { marginTop: 8, fontSize: 11, color: C.muted } }, sub.technician, ' · ', sub.timestamp)),
+                h(SOPPanel, { issues: sub.route.issues }),
+                h('div', { style: { display: 'flex', gap: 8 } },
+                  h('button', { style: Object.assign({}, btn(C.navy), { flex: 1 }), onClick: nextBattery }, '⚡ Next Battery'),
+                  (sub.route.cat === 'REPAIR' || sub.route.cat === 'WARRANTY') && h('button', {
+                    style: Object.assign({}, btn(C.amber), { flex: 1 }),
+                    onClick: function () { setRepMod(sub); setRepForm({ status: 'Pending Repair', partsReplaced: [] }); },
+                  }, '🔧 Open Repair')));
+            })()),
+
+          // ════════════════════ DASHBOARD ════════════════════
+          view === 'dashboard' && h(Fragment, null,
+            h('div', { style: card },
+              h('div', { style: sh }, 'Today\'s Summary'),
+              h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 12 } },
+                [['OK','✅',C.green],['REPAIR','🔧',C.blue],['WARRANTY','⚠️',C.red]].map(function (row) {
+                  var cat = row[0], ic = row[1], col = row[2];
+                  return h('div', { key: cat, style: { background: RS[cat].bg, borderRadius: 10, padding: '12px 6px', textAlign: 'center', border: '1.5px solid ' + col } },
+                    h('div', { style: { fontSize: 20 } }, ic),
+                    h('div', { style: { fontSize: 26, fontWeight: 800, color: col } }, counts[cat]),
+                    h('div', { style: { fontSize: 10, color: col, fontWeight: 600 } }, cat));
+                })),
+              h('div', { style: { textAlign: 'center', fontSize: 13, color: C.muted } }, 'Total scanned: ', h('strong', { style: { color: C.text } }, bats.length))),
+
+            h('div', { style: card },
+              h('div', { style: sh }, 'By Battery Type'),
+              Object.keys(BT).map(function (k) {
+                var bt2 = BT[k];
+                var pct = bats.length ? (typeCounts[k] / bats.length) : 0;
+                return h('div', { key: k, style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 9 } },
+                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                    h('div', { style: { width: 10, height: 10, borderRadius: '50%', background: bt2.color } }),
+                    h('span', { style: { fontSize: 14, fontWeight: 600 } }, bt2.name)),
+                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                    h('div', { style: { height: 8, borderRadius: 4, background: bt2.light, border: '1px solid ' + bt2.color, width: Math.max(4, pct * 140) } }),
+                    h('span', { style: { fontSize: 14, fontWeight: 700, color: bt2.color, minWidth: 22, textAlign: 'right' } }, typeCounts[k])));
+              })),
+
+            !isConfigured() && h('div', { style: Object.assign({}, card, { background: '#FFF8E1', border: '1.5px solid #F9A825' }) },
+              h('div', { style: { fontWeight: 700, color: C.amber, marginBottom: 6 } }, '⚙️ OneDrive Not Connected'),
+              h('div', { style: { fontSize: 13, color: '#5D4037', lineHeight: 1.5 } }, 'App is in offline mode — data saves locally only. To connect OneDrive, follow the SETUP_GUIDE.md and paste your Azure clientId and tenantId at the top of app.js.')),
+
+            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
+              h('button', { style: Object.assign({}, btn(C.blue), { width: '100%' }), onClick: function () { exportToExcel(bats); } }, '⬇️ Export Excel'),
+              h('button', { style: Object.assign({}, btn(C.red), { width: '100%' }), onClick: function () { if (window.confirm('Clear all local data? This cannot be undone.')) { ldb.clear(); refresh(); } } }, '🗑️ Clear Data'))),
+
+          // ════════════════════ LOG VIEW ════════════════════
+          view === 'log' && h(Fragment, null,
+            h('div', { style: { display: 'flex', gap: 5, marginBottom: 10 } },
+              ['ALL','OK','REPAIR','WARRANTY'].map(function (cat) {
+                var active = fcat === cat;
+                return h('button', {
+                  key: cat, onClick: function () { setFcat(cat); },
+                  style: { flex: 1, padding: '7px 4px', borderRadius: 8, cursor: 'pointer', border: '1.5px solid ' + (cat === 'ALL' ? C.border : (RS[cat] ? RS[cat].bdr : C.border)), background: active ? (cat === 'ALL' ? C.navy : (RS[cat] ? RS[cat].bg : '#eee')) : '#fff', color: active ? (cat === 'ALL' ? '#fff' : (RS[cat] ? RS[cat].tx : C.text)) : C.muted, fontWeight: 700, fontSize: 11 },
+                }, cat === 'ALL' ? 'ALL' : (RS[cat] ? RS[cat].ic : ''), ' ', cat, h('br'), h('span', { style: { fontWeight: 400, fontSize: 10 } }, cat === 'ALL' ? bats.length : counts[cat]));
+              })),
+            h('input', { style: Object.assign({}, inp, { fontSize: 13, marginBottom: 10 }), placeholder: 'Search serial, type, technician…', value: q, onChange: function (e) { setQ(e.target.value); } }),
+            h('button', { style: Object.assign({}, btn(C.blue), { width: '100%', marginBottom: 12, fontSize: 13 }), onClick: function () { exportToExcel(filtered); } }, '⬇️ Export ', filtered.length, ' Entries to Excel'),
+            filtered.length === 0 && h('div', { style: Object.assign({}, card, { textAlign: 'center', color: C.muted }) }, 'No entries found.'),
+            filtered.map(function (b) {
+              var rs  = RS[b.route && b.route.cat] || RS.REPAIR;
+              var bt2 = BT[b.batteryKey] || {};
+              return h('div', { key: b.id, style: Object.assign({}, card, { borderLeft: '4px solid ' + rs.bdr, padding: '11px 13px' }) },
+                h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
+                  h('div', null,
+                    h('div', { style: { fontWeight: 700, fontSize: 14, letterSpacing: 0.5 } }, b.serial),
+                    h('div', { style: { fontSize: 11, color: C.muted, marginTop: 2 } }, b.timestamp, ' · ', b.technician)),
+                  h('div', { style: { textAlign: 'right' } },
+                    h('span', { style: { background: bt2.light || '#eee', color: bt2.color || C.muted, border: '1px solid ' + (bt2.color || C.border), borderRadius: 8, padding: '1px 8px', fontSize: 11, fontWeight: 700 } }, b.batteryType),
+                    h('div', { style: { fontSize: 11, color: rs.tx, fontWeight: 700, marginTop: 4 } }, rs.ic, ' ', b.route && b.route.cat))),
+                h('div', { style: { marginTop: 7, display: 'flex', flexWrap: 'wrap', gap: '5px 12px', fontSize: 12, color: C.muted } },
+                  b.form && b.form.cellVoltageMin && h('span', null, 'Min:', b.form.cellVoltageMin, 'V'),
+                  b.form && b.form.cellVoltageMax && h('span', null, 'Max:', b.form.cellVoltageMax, 'V'),
+                  b.form && b.form.packVoltage    && h('span', null, 'Pack:', b.form.packVoltage, 'V'),
+                  b.form && b.form.mosfetStatus   && h('span', null, 'MOSFET:', b.form.mosfetStatus)),
+                b.route && b.route.issues && b.route.issues.length > 0 && h('div', { style: { marginTop: 5, display: 'flex', flexWrap: 'wrap', gap: 4 } },
+                  b.route.issues.slice(0, 3).map(function (iss, i) {
+                    return h('span', { key: i, style: { fontSize: 10, padding: '1px 7px', background: rs.bg, color: rs.tx, borderRadius: 8, border: '1px solid ' + rs.bdr } }, iss);
+                  }),
+                  b.route.issues.length > 3 && h('span', { style: { fontSize: 10, color: C.muted } }, '+', b.route.issues.length - 3, ' more')),
+                (b.route && (b.route.cat === 'REPAIR' || b.route.cat === 'WARRANTY')) && h('button', {
+                  onClick: function () { setRepMod(b); setRepForm({ status: 'Pending Repair', partsReplaced: [] }); },
+                  style: { marginTop: 8, padding: '5px 11px', borderRadius: 6, border: '1px solid ' + C.blue, background: '#fff', color: C.blue, fontSize: 12, fontWeight: 600, cursor: 'pointer' },
+                }, '+ Open Repair'));
+            })),
+
+          // ════════════════════ REPAIRS VIEW ════════════════════
+          view === 'repairs' && h(Fragment, null,
+            reps.length === 0 && h('div', { style: Object.assign({}, card, { textAlign: 'center', color: C.muted }) }, 'No repairs opened yet.'),
+            reps.slice().reverse().map(function (r) {
+              var sc = r.dispatched ? C.green : r.readyForDispatch ? C.amber : C.blue;
+              return h('div', { key: r.id, style: Object.assign({}, card, { borderLeft: '4px solid ' + sc }) },
+                h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
+                  h('div', null,
+                    h('div', { style: { fontWeight: 700, fontSize: 13 } }, r.serial),
+                    h('div', { style: { fontSize: 11, color: C.muted } }, r.batteryType, ' · ', r.openedAt, ' · ', r.openedBy)),
+                  h('span', { style: { background: r.dispatched ? '#E8F5E9' : r.readyForDispatch ? '#FFF8E1' : '#E3F2FD', color: sc, border: '1px solid ' + sc, borderRadius: 8, padding: '2px 8px', fontSize: 11, fontWeight: 700 } },
+                    r.dispatched ? 'Dispatched' : r.readyForDispatch ? 'Ready to Dispatch' : r.status)),
+                r.partsReplaced && r.partsReplaced.length > 0 && h('div', { style: { fontSize: 12, marginTop: 5, color: C.muted } }, 'Parts: ', r.partsReplaced.join(', ')),
+                r.postRepairNotes && h('div', { style: { fontSize: 12, marginTop: 3, color: C.text } }, r.postRepairNotes),
+                r.dispatched && r.dispatchDate && h('div', { style: { fontSize: 12, marginTop: 3, color: C.green } }, 'Dispatched: ', r.dispatchDate),
+                !r.dispatched && h('div', { style: { marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6 } },
+                  STATUSES.filter(function (st) { return st !== 'Dispatched' && st !== 'Ready for Dispatch'; }).map(function (st) {
+                    return h('button', { key: st, onClick: function () { ldb.updateRepair(r.id, { status: st }); refresh(); }, style: { padding: '4px 8px', borderRadius: 6, border: '1px solid ' + (r.status === st ? C.blue : C.border), background: r.status === st ? C.blue : '#fff', color: r.status === st ? '#fff' : C.muted, fontSize: 11, fontWeight: 600, cursor: 'pointer' } }, st);
+                  }),
+                  r.status === 'Post-Repair Check' && h('button', { onClick: function () { ldb.updateRepair(r.id, { onlineStatus: 'Online', status: 'Online Test' }); refresh(); }, style: Object.assign({}, btn(C.green), { fontSize: 11, padding: '4px 9px' }) }, '✓ Online'),
+                  r.onlineStatus === 'Online' && !r.readyForDispatch && h('button', { onClick: function () { ldb.updateRepair(r.id, { readyForDispatch: true, status: 'Ready for Dispatch' }); refresh(); }, style: Object.assign({}, btn(C.amber), { fontSize: 11, padding: '4px 9px' }) }, '✓ Ready'),
+                  r.readyForDispatch && !r.dispatched && h('button', { onClick: function () { ldb.updateRepair(r.id, { dispatched: true, dispatchDate: new Date().toLocaleString('en-UG'), status: 'Dispatched' }); refresh(); }, style: Object.assign({}, btn(C.green), { fontSize: 11, padding: '4px 9px' }) }, '🚀 Dispatch')));
+            })),
+
+          // ════════════════════ SEARCH VIEW ════════════════════
+          view === 'search' && h(Fragment, null,
+            h('div', { style: card },
+              h('div', { style: sh }, 'Search Battery History'),
+              h('input', { style: inp, placeholder: 'Enter serial number…', value: q, onChange: function (e) { setQ(e.target.value); }, autoFocus: true })),
+            q.length > 2 && (function () {
+              var found = bats.filter(function (b) {
+                return (b.serial && b.serial.indexOf(q.toUpperCase()) !== -1)
+                  || (b.batteryType && b.batteryType.toUpperCase().indexOf(q.toUpperCase()) !== -1);
+              });
+              if (!found.length) return h('div', { style: Object.assign({}, card, { textAlign: 'center', color: C.muted }) }, 'No battery found for "', q, '"');
+              return found.map(function (b) {
+                var rs    = RS[b.route && b.route.cat] || RS.REPAIR;
+                var bReps = reps.filter(function (r) { return r.serial === b.serial; });
+                return h('div', { key: b.id, style: Object.assign({}, card, { borderLeft: '4px solid ' + rs.bdr }) },
+                  h('div', { style: { fontWeight: 700, fontSize: 15, letterSpacing: 1 } }, b.serial),
+                  h('div', { style: { fontSize: 12, color: C.muted } }, b.batteryType, ' · ', b.timestamp, ' · ', b.technician),
+                  h('span', { style: { background: rs.bg, color: rs.tx, border: '1px solid ' + rs.bdr, borderRadius: 8, padding: '2px 10px', fontSize: 12, fontWeight: 700, display: 'inline-block', marginTop: 6 } }, rs.ic, ' ', rs.lb),
+                  h('div', { style: { marginTop: 10, display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 6, fontSize: 12 } },
+                    [['Cell Min', b.form && b.form.cellVoltageMin, 'V'],['Cell Max', b.form && b.form.cellVoltageMax, 'V'],['Pack', b.form && b.form.packVoltage, 'V'],['MOSFET', b.form && b.form.mosfetStatus, ''],['Charge', b.form && b.form.canCharge, ''],['Discharge', b.form && b.form.canDischarge, '']].map(function (row) {
+                      return h('div', { key: row[0] }, h('span', { style: { color: C.muted, fontSize: 11 } }, row[0]), h('br'), h('strong', null, row[1] || '—', row[1] ? row[2] : ''));
+                    })),
+                  b.route && b.route.issues && b.route.issues.length > 0 && h('div', { style: { marginTop: 8 } },
+                    b.route.issues.map(function (iss, i) { return h('div', { key: i, style: { fontSize: 11, color: rs.tx } }, '• ', iss); })),
+                  bReps.length > 0 && h('div', { style: { marginTop: 10 } },
+                    h('div', { style: { fontSize: 12, fontWeight: 700, color: C.muted, marginBottom: 4 } }, 'Repair History (', bReps.length, ')'),
+                    bReps.map(function (r) {
+                      return h('div', { key: r.id, style: { fontSize: 12, padding: '5px 8px', background: C.surface, borderRadius: 6, marginBottom: 4 } },
+                        h('strong', null, r.id), ' · ', r.status, ' · ', r.openedAt,
+                        r.dispatched && h('span', { style: { color: C.green } }, ' · Dispatched ', r.dispatchDate));
+                    })));
+              });
+            })()),
+
+          // ════════════════════ SOP REFERENCE VIEW ════════════════════
+          view === 'sop' && h(Fragment, null,
+            h('div', { style: Object.assign({}, card, { background: '#E3F2FD', border: '1.5px solid ' + C.blue }) },
+              h('div', { style: { fontWeight: 800, fontSize: 15, color: C.navy, marginBottom: 4 } }, '📖 SOP Troubleshooting Reference'),
+              h('div', { style: { fontSize: 13, color: '#1A237E', lineHeight: 1.5 } }, 'Full step-by-step repair procedures for all common faults. Tap any to expand.')),
+            Object.keys(SOP).map(function (key) {
+              var g     = SOP[key];
+              var isO   = sopView === key;
+              var rCat  = g.route.indexOf('WARRANTY') !== -1 ? 'WARRANTY' : g.route.indexOf('REPAIR') !== -1 ? 'REPAIR' : 'OK';
+              var rS    = RS[rCat];
+              return h('div', { key: key, style: Object.assign({}, card, { padding: 0, overflow: 'hidden' }) },
+                h('button', { onClick: function () { setSopView(isO ? null : key); }, style: { width: '100%', padding: '13px 15px', background: isO ? '#E3F2FD' : '#fff', border: 'none', textAlign: 'left', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontFamily: 'inherit' } },
+                  h('span', { style: { fontWeight: 700, fontSize: 14, color: C.navy } }, g.title),
+                  h('span', { style: { fontSize: 16, color: C.blue } }, isO ? '▲' : '▼')),
+                isO && h('div', { style: { padding: '14px 15px', background: '#FAFBFF', borderTop: '1px solid ' + C.border } },
+                  h('div', { style: { fontSize: 13, color: '#5D4037', marginBottom: 10, padding: '8px 10px', background: 'rgba(230,81,0,0.07)', borderRadius: 6, lineHeight: 1.6 } },
+                    h('strong', null, 'Root Cause: '), g.cause),
+                  h('div', { style: { fontWeight: 700, fontSize: 13, color: C.navy, marginBottom: 8 } }, 'Repair Procedure:'),
+                  g.steps.map(function (step, i) {
+                    return h('div', { key: i, style: { display: 'flex', gap: 10, marginBottom: 8, fontSize: 13, lineHeight: 1.5 } },
+                      h('div', { style: { background: C.blue, color: '#fff', borderRadius: '50%', width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0, marginTop: 1 } }, i + 1),
+                      h('div', { style: { color: C.text } }, step));
+                  }),
+                  h('div', { style: { marginBottom: 8 } },
+                    h('span', { style: { fontSize: 12, padding: '3px 10px', borderRadius: 10, background: rS.bg, color: rS.tx, border: '1px solid ' + rS.bdr, fontWeight: 700 } }, '📍 ', g.route)),
+                  h('div', { style: { fontSize: 13, color: C.red, background: '#FFEBEE', padding: '8px 10px', borderRadius: 6, lineHeight: 1.5 } },
+                    '⚠️ ', h('strong', null, 'WARNING: '), g.warning)));
+            }))
+        ), // end body
+
+        // ── Bottom Navigation ──────────────────────────────────────────────
+        h('div', { style: { position: 'fixed', bottom: 0, left: 0, right: 0, background: C.navy, display: 'flex', borderTop: '1px solid rgba(255,255,255,0.08)', zIndex: 100 } },
+          nav.map(function (n) {
+            return h('button', {
+              key: n.id, onClick: function () { setView(n.id); },
+              style: { flex: 1, padding: '9px 2px 7px', border: 'none', background: 'transparent', color: view === n.id ? '#42A5F5' : 'rgba(255,255,255,0.4)', cursor: 'pointer', fontSize: 10, fontWeight: 600, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 },
+            }, h('span', { style: { fontSize: 19 } }, n.ic), n.lb);
+          })),
+
+        // ── Repair Modal ───────────────────────────────────────────────────
+        repMod && h('div', { style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 500, display: 'flex', alignItems: 'flex-end' } },
+          h('div', { style: { background: '#fff', borderRadius: '16px 16px 0 0', padding: '20px 15px', width: '100%', maxHeight: '85vh', overflowY: 'auto', boxSizing: 'border-box' } },
+            h('div', { style: { fontSize: 16, fontWeight: 800, marginBottom: 3 } }, 'Repair: ', repMod.serial),
+            h('div', { style: { fontSize: 12, color: C.muted, marginBottom: 14 } }, repMod.batteryType, ' · ', repMod.route && repMod.route.cat),
+            h('label', { style: fl }, 'Status'),
+            h('select', { style: Object.assign({}, inp, { marginBottom: 12 }), value: repForm.status || '', onChange: function (e) { setRepForm(function (p) { return Object.assign({}, p, { status: e.target.value }); }); } },
+              STATUSES.map(function (st) { return h('option', { key: st }, st); })),
+            h('label', { style: fl }, 'Parts to Replace'),
+            h(Checks, { opts: MISSING, val: repForm.partsReplaced || [], onChange: function (v) { setRepForm(function (p) { return Object.assign({}, p, { partsReplaced: v }); }); } }),
+            h('label', { style: Object.assign({}, fl, { marginTop: 14 }) }, 'Post-Repair Notes / Condition After'),
+            h('textarea', { rows: 3, style: Object.assign({}, inp, { resize: 'vertical' }), placeholder: 'Condition after repair, test results, observations…', value: repForm.postRepairNotes || '', onChange: function (e) { setRepForm(function (p) { return Object.assign({}, p, { postRepairNotes: e.target.value }); }); } }),
+            h('label', { style: Object.assign({}, fl, { marginTop: 12 }) }, 'Online / Offline Status'),
+            h('select', { style: Object.assign({}, inp, { marginBottom: 14 }), value: repForm.onlineStatus || '', onChange: function (e) { setRepForm(function (p) { return Object.assign({}, p, { onlineStatus: e.target.value }); }); } },
+              h('option', { value: '' }, '— select —'),
+              ['Online – Charging','Online – Discharging','Offline – Pending retest','Offline – Failed'].map(function (o) { return h('option', { key: o }, o); })),
+            h('div', { style: { display: 'flex', gap: 10 } },
+              h('button', {
+                style: Object.assign({}, btn(C.blue), { flex: 1 }),
+                onClick: function () {
+                  ldb.addRepair(Object.assign({ id: 'REP-' + Date.now(), serial: repMod.serial, batteryType: repMod.batteryType, openedBy: tech ? tech.name : 'Unknown', openedAt: new Date().toLocaleString('en-UG') }, repForm));
+                  refresh(); setRepMod(null);
+                },
+              }, 'Save Repair Record'),
+              h('button', { style: Object.assign({}, btn('#fff', C.muted, C.border), { flex: 1 }), onClick: function () { setRepMod(null); } }, 'Cancel')))));
+    } // end App
+
+    // ── Mount ──────────────────────────────────────────────────────────────────
+    var container = document.getElementById('app');
+    if (!container) { console.error('[SpiroQMS] #app element not found'); return; }
+    ReactDOM.createRoot(container).render(h(App));
+
+  } // end initApp
+}());
